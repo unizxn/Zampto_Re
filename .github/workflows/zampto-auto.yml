@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            xvfb ffmpeg curl \
+            xvfb ffmpeg curl unzip \
             fonts-noto-cjk \
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
             libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
@@ -35,6 +35,22 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
+
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
+          unzip -q xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me || echo "直连失败"
+          echo ""
+          echo "代理 IP："
+          curl -s --max-time 10 --socks5 127.0.0.1:10808 ifconfig.me || echo "代理失败，请检查 V2RAY_CONFIG"
+          echo ""
 
       - name: 运行脚本（带虚拟显示器和录屏）
         env:
@@ -47,7 +63,7 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
           GALLIUM_DRIVER: "llvmpipe"
         run: |
-          # 启动虚拟显示器（CloakBrowser headless=False 需要）
+          # 启动虚拟显示器
           Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
           XVFB_PID=$!
           sleep 2
