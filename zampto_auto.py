@@ -12,6 +12,7 @@ SERVER_ID = os.environ.get("ZAMPTO_SERVER_ID", "")
 
 WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
 WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
+SKIP_RENEW     = os.environ.get("SKIP_RENEW", "false").lower() == "true"
 
 BASE_URL    = "https://dash.zampto.net"
 AUTH_URL    = "https://auth.zampto.net/sign-in"
@@ -497,8 +498,12 @@ def main():
                 status = "Starting → Running"
                 log.info("✅ 已发送启动指令")
 
-        # 5. 续期（传入续期前 expiry 用于对比验证）
-        renewed = renew_server(page, SERVER_ID, expiry_before=expiry)
+        # 5. 续期（SKIP_RENEW=true 时跳过，只做启动）
+        if SKIP_RENEW:
+            log.info("⏭️ SKIP_RENEW=true，跳过续期步骤（Uptime Kuma 紧急启动模式）")
+            renewed = False
+        else:
+            renewed = renew_server(page, SERVER_ID, expiry_before=expiry)
 
         # 6. 续期后重新读取最新 expiry
         new_expiry = expiry
@@ -509,7 +514,7 @@ def main():
             log.info(f"续期后到期信息: {new_expiry}")
 
         # 7. 推送
-        lines = ["🖥️ Zampto 服务器日报"]
+        lines = ["🚨 Zampto 紧急启动报告" if SKIP_RENEW else "🖥️ Zampto 服务器日报"]
         lines.append(f"服务器 ID: {SERVER_ID}")
         lines.append(f"地址: {address}")
         lines.append("")
@@ -521,7 +526,9 @@ def main():
         lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
             lines.append(f"Last Renewed: {last_renew}")
-        if renewed:
+        if SKIP_RENEW:
+            lines.append("  （续期已跳过，仅紧急启动）")
+        elif renewed:
             lines.append("  → 已自动续期 ✅")
         else:
             lines.append("  ⚠️ 续期失败，请手动检查")
