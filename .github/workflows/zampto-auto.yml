@@ -13,6 +13,14 @@ on:
         options:
           - 'false'
           - 'true'
+      enable_recording:
+        description: '启用录屏（true=录制操作视频，false=不录制）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   zampto-auto:
@@ -73,18 +81,26 @@ jobs:
           XVFB_PID=$!
           sleep 2
 
-          ffmpeg -f x11grab -video_size 1280x720 -framerate 10 -i :99 \
-            -codec:v libx264 -preset ultrafast -crf 30 \
-            -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
-            > /tmp/ffmpeg.log 2>&1 &
-          RECORD_PID=$!
-          sleep 2
+          RECORD_PID=""
+          if [ "${{ github.event.inputs.enable_recording || 'false' }}" = "true" ]; then
+            echo "🎥 录屏已启用"
+            ffmpeg -f x11grab -video_size 1280x720 -framerate 10 -i :99 \
+              -codec:v libx264 -preset ultrafast -crf 30 \
+              -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
+              > /tmp/ffmpeg.log 2>&1 &
+            RECORD_PID=$!
+            sleep 2
+          else
+            echo "🎥 录屏已禁用（可在手动触发时将 enable_recording 设为 true）"
+          fi
 
           timeout 600 python zampto_auto.py || echo "脚本退出码: $?"
 
           sleep 2
-          kill $RECORD_PID 2>/dev/null || true
-          wait $RECORD_PID 2>/dev/null || true
+          if [ -n "$RECORD_PID" ]; then
+            kill $RECORD_PID 2>/dev/null || true
+            wait $RECORD_PID 2>/dev/null || true
+          fi
           kill $XVFB_PID 2>/dev/null || true
 
       - name: 上传截图和录屏
@@ -98,6 +114,7 @@ jobs:
             /tmp/ffmpeg.log
           if-no-files-found: ignore
           retention-days: 3
+          # 注意：若 enable_recording=false，recording.mp4 不会生成，上传时自动忽略
 
       - name: 清理旧运行记录（只保留最新 1 条）
         if: always()
