@@ -359,16 +359,51 @@ def start_server(page) -> bool:
             log.info("✅ 已点击 Start 按钮")
             time.sleep(5)
             take_screenshot(page, "04_after_start")
-            body = get_text(page)
-            if "Running" in body or "Starting" in body:
-                log.info("✅ 服务器正在启动")
-            return True
         else:
             log.warning("Start 按钮不可见（服务器可能已在运行）")
-            return False
+            # 可能已经在 Running，继续等待确认
     except Exception as e:
         log.warning(f"点击 Start 失败: {e}")
         return False
+
+    # ── 轮询等待服务器真正变为 Running ──────────────────────────────────
+    log.info("⏳ 等待服务器变为 Running（最多 5 分钟）...")
+    wait_total = 300   # 最多等 300 秒
+    poll_interval = 10  # 每 10 秒刷新一次
+    elapsed = 0
+    final_status = "Unknown"
+
+    while elapsed < wait_total:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            page.reload(timeout=20000, wait_until="domcontentloaded")
+            time.sleep(3)
+            body = get_text(page)
+            # 优先匹配状态指示器文字
+            if "Running" in body:
+                final_status = "Running"
+                log.info(f"✅ 服务器已变为 Running（等待了 {elapsed}s）")
+                take_screenshot(page, f"05_running_confirmed")
+                break
+            elif "Starting" in body:
+                final_status = "Starting"
+                log.info(f"  [{elapsed}s] 还在 Starting，继续等待...")
+                take_screenshot(page, f"05_still_starting_{elapsed}s")
+            elif "Offline" in body or "Stopped" in body:
+                final_status = "Offline"
+                log.warning(f"  [{elapsed}s] 服务器回到 Offline，启动失败")
+                take_screenshot(page, f"05_start_failed_{elapsed}s")
+                break
+            else:
+                log.info(f"  [{elapsed}s] 状态未知，继续等待...")
+        except Exception as e:
+            log.warning(f"  [{elapsed}s] 刷新页面异常: {e}")
+    else:
+        log.warning(f"⚠️ 等待超时（{wait_total}s），最后状态: {final_status}")
+        take_screenshot(page, "05_start_timeout")
+
+    return final_status == "Running"
 
 # ---------- 续期 ----------
 def renew_server(page, server_id: str, expiry_before: str) -> bool:
@@ -495,8 +530,11 @@ def main():
             log.info("🔴 服务器已停止，尝试启动...")
             started = start_server(page)
             if started:
-                status = "Starting → Running"
-                log.info("✅ 已发送启动指令")
+                status = "Running"
+                log.info("✅ 服务器已确认 Running")
+            else:
+                status = "Start Failed / Timeout"
+                log.warning("⚠️ 服务器启动失败或超时，未能确认 Running")
 
         # 5. 续期（SKIP_RENEW=true 时跳过，只做启动）
         if SKIP_RENEW:
@@ -521,7 +559,9 @@ def main():
         status_icon = "🟢" if "running" in status.lower() else ("🟡" if "starting" in status.lower() else "🔴")
         lines.append(f"状态: {status_icon} {status}")
         if started:
-            lines.append("  → 已自动触发启动 ✅")
+            lines.append("  → 已启动并确认 Running ✅")
+        elif "start" in status.lower() or "failed" in status.lower():
+            lines.append("  ⚠️ 启动失败或超时，请手动检查")
         lines.append("")
         lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
