@@ -79,16 +79,16 @@ def tcp_check(host: str, port: int, timeout: int = 5) -> bool:
 
 def wait_for_port(host: str, port: int, max_wait: int = 120, interval: int = 10) -> bool:
     """轮询等待端口真正可连接，最多等 max_wait 秒。"""
-    log.info(f"🔌 等待端口 {host}:{port} 可连接（最多 {max_wait}s）...")
+    log.info(f"🔌 等待端口可连接（最多 {max_wait}s）...")
     elapsed = 0
     while elapsed < max_wait:
         if tcp_check(host, port):
-            log.info(f"✅ 端口 {host}:{port} 已可连接（等待了 {elapsed}s）")
+            log.info(f"✅ 端口已可连接（等待了 {elapsed}s）")
             return True
         time.sleep(interval)
         elapsed += interval
         log.info(f"  [{elapsed}s] 端口还未开放，继续等待...")
-    log.warning(f"⚠️ 端口 {host}:{port} 等待超时（{max_wait}s）")
+    log.warning(f"⚠️ 端口等待超时（{max_wait}s）")
     return False
 
 def wait_for_url_contains(page, keyword, timeout=15) -> bool:
@@ -229,7 +229,7 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
 
 # ---------- 登录 ----------
 def login(page, max_retries=3) -> bool:
-    login_url = "https://auth.zampto.net/sign-in?app_id=bmhk6c8qdqxphlyscztgl"
+    login_url = "https://auth.zampto.net/sign-in?app_id=YOUR_APP_ID"
 
     for attempt in range(1, max_retries + 1):
         log.info(f"登录 {attempt}/{max_retries}")
@@ -254,7 +254,7 @@ def login(page, max_retries=3) -> bool:
             user_el.click()
             user_el.fill("")
             user_el.type(USERNAME, delay=random.randint(60, 130))
-            log.info(f"已填写用户名: {USERNAME}")
+            log.info("已填写用户名")
         except Exception as e:
             log.warning(f"填写用户名失败: {e}")
             continue
@@ -309,7 +309,7 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, "01_login_success")
             return True
 
-        log.warning(f"登录后未跳转，当前 URL: {page.url}")
+        log.warning(f"登录后未跳转，请检查账号密码")
         take_screenshot(page, f"login_fail_{attempt}")
         time.sleep(2)
 
@@ -322,7 +322,7 @@ def get_server_info(page, server_id: str) -> dict:
     然后访问 console 页读取真实运行状态（Running / Stopped）。
     """
     server_url = f"{BASE_URL}/server?id={server_id}"
-    log.info(f"访问服务器详情: {server_url}")
+    log.info(f"访问服务器详情页")
     try:
         page.goto(server_url, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
@@ -345,7 +345,7 @@ def get_server_info(page, server_id: str) -> dict:
 
     # 真实运行状态在 Console 页（server 详情页显示的是账号 Active，不是运行状态）
     console_url = f"{BASE_URL}/server-console?id={server_id}"
-    log.info(f"访问 Console 页读取运行状态: {console_url}")
+    log.info(f"访问 Console 页读取运行状态")
     try:
         page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
@@ -364,13 +364,13 @@ def get_server_info(page, server_id: str) -> dict:
     }""")
 
     info["status"] = status_text or "Unknown"
-    log.info(f"服务器信息: {info}")
+    log.info(f"服务器信息: expiry={info.get('expiry')}, status={info.get('status')}, address=<已隐藏>")
     return info
 
 # ---------- 启动服务器 ----------
 def start_server(page) -> bool:
     console_url = f"{BASE_URL}/server-console?id={SERVER_ID}"
-    log.info(f"直接导航到 Console: {console_url}")
+    log.info(f"直接导航到 Console 页")
     page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
     time.sleep(3)
     take_screenshot(page, "03_console_page")
@@ -430,9 +430,6 @@ def start_server(page) -> bool:
         return False
 
     # ── 面板显示 Running，进一步用 TCP 验证端口真的开了 ─────────────────
-    # address 格式 node11.zampto.net:40114，从全局 address 变量获取不到，
-    # 改为从环境变量 ZAMPTO_SERVER_ADDRESS 读取，或者用固定的 SERVER_ID 映射。
-    # 实际上 address 在 main 里才有，这里只能通过页面再读一次。
     addr_raw = None
     try:
         addr_raw = page.evaluate("""() => {
@@ -451,11 +448,11 @@ def start_server(page) -> bool:
                 port = int(port_str)
                 port_ok = wait_for_port(host, port, max_wait=120, interval=10)
                 if port_ok:
-                    log.info(f"✅ TCP 端口 {addr_raw} 验证通过，服务器真正可连接")
+                    log.info(f"✅ TCP 端口验证通过，服务器真正可连接")
                     take_screenshot(page, "06_port_verified")
                     return True
                 else:
-                    log.warning(f"⚠️ 端口 {addr_raw} 不可达，尝试 Restart 后再等一轮...")
+                    log.warning(f"⚠️ 端口不可达，尝试 Restart 后再等一轮...")
                     take_screenshot(page, "06_port_unreachable_before_restart")
 
                     # ── 点击 Restart 按钮 ────────────────────────────────
@@ -506,14 +503,14 @@ def start_server(page) -> bool:
                         return False
 
                     # ── 再次验证端口 ──────────────────────────────────────
-                    log.info(f"🔌 Restart 后再次验证端口 {addr_raw}...")
+                    log.info(f"🔌 Restart 后再次验证端口...")
                     port_ok2 = wait_for_port(host, port, max_wait=120, interval=10)
                     if port_ok2:
-                        log.info(f"✅ Restart 后端口 {addr_raw} 验证通过")
+                        log.info(f"✅ Restart 后端口验证通过")
                         take_screenshot(page, "09_port_verified_after_restart")
                         return True
                     else:
-                        log.warning(f"⚠️ Restart 后端口 {addr_raw} 仍不可达，请手动处理")
+                        log.warning(f"⚠️ Restart 后端口仍不可达，请手动处理")
                         take_screenshot(page, "09_port_still_unreachable")
                         return False
             except ValueError:
@@ -532,7 +529,7 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
     expiry_before: 续期前的 expiry 字符串，用于对比判断是否真正续期成功。
     """
     server_url = f"{BASE_URL}/server?id={server_id}"
-    log.info(f"准备续期，访问: {server_url}")
+    log.info(f"准备续期，访问服务器详情页")
     try:
         page.goto(server_url, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
@@ -640,7 +637,7 @@ def main():
         address    = info.get("address", "未知")
         last_renew = info.get("lastRenewed", "未知")
 
-        log.info(f"服务器状态: {status} | 到期: {expiry} | 地址: {address}")
+        log.info(f"服务器状态: {status} | 到期: {expiry}")
 
         # 4. 如果服务器已停止，先启动
         started = False
@@ -671,8 +668,8 @@ def main():
 
         # 7. 推送
         lines = ["🚨 Zampto 紧急启动报告" if SKIP_RENEW else "🖥️ Zampto 服务器日报"]
-        lines.append(f"服务器 ID: {SERVER_ID}")
-        lines.append(f"地址: {address}")
+        lines.append(f"服务器 ID: ***")
+        lines.append(f"地址: ***")
         lines.append("")
         status_icon = "🟢" if "running" in status.lower() else ("🟡" if "starting" in status.lower() else "🔴")
         lines.append(f"状态: {status_icon} {status}")
