@@ -379,10 +379,14 @@ def main():
         wxpush("❌ 未配置 ZAMPTO_SERVER_ID，任务中止")
         return
 
+    # 代理：Xray 本地 SOCKS5（GitHub Actions 环境通过 V2RAY_CONFIG 启动）
+    PROXY_SERVER = "socks5://127.0.0.1:10808"
+
     log.info("启动 CloakBrowser...")
     browser = launch(
         headless=False,
         humanize=True,
+        proxy=PROXY_SERVER,
         geoip=True,
     )
     page = browser.new_page()
