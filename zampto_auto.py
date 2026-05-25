@@ -243,9 +243,9 @@ def dismiss_consent_modal(page):
 def get_server_info(page, server_id: str) -> dict:
     """
     访问服务器详情页，读取：
-    - STATUS（Running / Stopped）
     - Expiry (Next Renewal) 文本
     - 服务器地址
+    然后访问 console 页读取真实运行状态（Running / Stopped）。
     """
     server_url = f"{BASE_URL}/server?id={server_id}"
     log.info(f"访问服务器详情: {server_url}")
@@ -273,18 +273,36 @@ def get_server_info(page, server_id: str) -> dict:
         var addrMatch = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
         var address = addrMatch ? addrMatch[0] : null;
 
-        // 判断状态
-        var statusEl = document.querySelector('[class*="status"], [class*="Status"]');
-        var statusText = statusEl ? statusEl.innerText.trim() : '';
-        if (!statusText) {
-            // 从 body 文本匹配
-            var sm = body.match(/Running|Stopped|Starting|Stopping/i);
-            statusText = sm ? sm[0] : 'Unknown';
-        }
-
-        return { expiry, lastRenewed, address, status: statusText };
+        return { expiry, lastRenewed, address };
     }""")
 
+    # ✅ 修复：真实运行状态在 Console 页面，不在 server 详情页
+    # server 详情页显示的是账号"Active"状态，不是服务器运行状态
+    console_url = f"{BASE_URL}/server-console?id={server_id}"
+    log.info(f"访问 Console 页读取运行状态: {console_url}")
+    try:
+        page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning(f"访问 Console 页超时: {e}")
+
+    time.sleep(3)
+
+    status_text = page.evaluate("""() => {
+        // Console 页面用 id="serverStatus" 显示运行状态
+        var statusEl = document.getElementById('serverStatus');
+        if (statusEl) return statusEl.innerText.trim();
+
+        // 备用：class 含 status-running / status-stopped
+        var runEl = document.querySelector('.status-running, .status-stopped, .status-starting');
+        if (runEl) return runEl.innerText.trim();
+
+        // 备用：从 body 文本匹配
+        var body = document.body.innerText || '';
+        var sm = body.match(/Running(?:\\s*\\([^)]+\\))?|Stopped|Starting|Stopping/i);
+        return sm ? sm[0] : 'Unknown';
+    }""")
+
+    info["status"] = status_text or "Unknown"
     log.info(f"服务器信息: {info}")
     return info
 
@@ -347,9 +365,12 @@ def renew_server(page, server_id: str) -> bool:
 
     time.sleep(3)
 
-    # 点击 Renew Server 按钮
+    # ✅ 修复：Renew Server 是 <a> 标签（onclick），不是 <button>
+    # 原代码 page.locator('button:has-text("Renew Server")') 永远找不到
     try:
-        renew_btn = page.locator('button:has-text("Renew Server")').first
+        renew_btn = page.locator(
+            'a:has-text("Renew Server"), button:has-text("Renew Server")'
+        ).first
         if not renew_btn.is_visible(timeout=8000):
             # 尝试滚动到按钮
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
