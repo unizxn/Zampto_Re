@@ -6,9 +6,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ---------- 环境变量 ----------
-USERNAME = os.environ["ZAMPTO_USERNAME"]   # 用户名或邮箱
-PASSWORD = os.environ["ZAMPTO_PASSWORD"]   # 密码
-SERVER_ID = os.environ.get("ZAMPTO_SERVER_ID", "")   # 服务器 ID，如 6710
+USERNAME  = os.environ["ZAMPTO_USERNAME"]
+PASSWORD  = os.environ["ZAMPTO_PASSWORD"]
+SERVER_ID = os.environ.get("ZAMPTO_SERVER_ID", "")
 
 WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "")
 WXPUSHER_UID   = os.environ.get("WXPUSHER_UID", "")
@@ -74,25 +74,121 @@ def wait_for_url_contains(page, keyword, timeout=15) -> bool:
     except:
         return keyword in page.url
 
+# ---------- 解析 expiry 字符串为总分钟数（用于比较）----------
+def parse_expiry_minutes(expiry_str: str) -> int:
+    """
+    将 "1 day 22h 47m" 或 "2 days 1h 5m" 之类解析为总分钟数。
+    解析失败返回 -1。
+    """
+    if not expiry_str:
+        return -1
+    total = 0
+    m = re.search(r'(\d+)\s*day', expiry_str)
+    if m:
+        total += int(m.group(1)) * 24 * 60
+    m = re.search(r'(\d+)\s*h', expiry_str)
+    if m:
+        total += int(m.group(1)) * 60
+    m = re.search(r'(\d+)\s*m', expiry_str)
+    if m:
+        total += int(m.group(1))
+    return total if total > 0 else -1
+
+# ---------- 关闭所有弹窗（广告 + GDPR）----------
+def dismiss_all_popups(page):
+    """
+    关闭页面上所有可能出现的弹窗：
+    1. 广告弹窗（有 Close 按钮，或含外部域名链接）
+    2. GDPR Cookie 同意弹窗
+    每次调用最多等待 5 秒，关掉后继续检测，最多循环 3 轮。
+    """
+    for round_idx in range(3):
+        closed_any = False
+
+        closed = page.evaluate("""() => {
+            var count = 0;
+
+            // ① 优先找带明确文字的关闭按钮
+            var closeTexts = ['Close', 'close', 'Schließen', '×', 'X'];
+            for (var t of closeTexts) {
+                var btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                for (var b of btns) {
+                    if (b.innerText && b.innerText.trim() === t) {
+                        // 确认它在某种弹窗/overlay 容器内
+                        var parent = b.closest('[class*="modal"],[class*="popup"],[class*="overlay"],[class*="dialog"],[class*="ad-"]');
+                        if (parent) { b.click(); count++; break; }
+                    }
+                }
+            }
+
+            // ② aria-label="Close" 的按钮
+            var ariaClose = document.querySelector('button[aria-label="Close"], button[aria-label="close"], [aria-label="Dismiss"]');
+            if (ariaClose) { ariaClose.click(); count++; }
+
+            // ③ GDPR：Nicht einwilligen / Decline / Reject
+            var gdprTexts = ['Nicht einwilligen', 'Decline', 'Reject'];
+            for (var gt of gdprTexts) {
+                var gb = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === gt);
+                if (gb) { gb.click(); count++; break; }
+            }
+
+            return count;
+        }""")
+
+        if closed and closed > 0:
+            log.info(f"  已关闭 {closed} 个弹窗（第 {round_idx+1} 轮）")
+            closed_any = True
+            time.sleep(1)
+
+        # 检查是否还有可见弹窗
+        has_popup = page.evaluate("""() => {
+            var selectors = [
+                '[class*="modal"]:not([style*="display: none"])',
+                '[class*="popup"]:not([style*="display: none"])',
+                '[class*="overlay"]:not([style*="display: none"])',
+            ];
+            for (var s of selectors) {
+                var el = document.querySelector(s);
+                if (el && el.offsetParent !== null) return true;
+            }
+            return false;
+        }""")
+
+        if not has_popup:
+            break
+
+        if not closed_any:
+            # 没关掉也没新弹窗，退出
+            break
+
+        time.sleep(1)
+
 # ---------- CF Turnstile 等待 ----------
 def wait_cf_turnstile(page, timeout=60) -> bool:
     """
     等待 Cloudflare Turnstile 验证自动完成。
-    CloakBrowser 会自动处理 Turnstile，我们只需等待 loading 消失。
+    同时确认续期弹窗（id=renewModal）是可见的——
+    如果弹窗根本不在，说明被广告弹窗打断了，直接返回 False。
     """
     log.info("等待 Cloudflare Turnstile 验证...")
+
+    # 先确认续期弹窗真的出现了
+    renew_modal_visible = page.evaluate("""() => {
+        var m = document.getElementById('renewModal');
+        if (!m) return false;
+        return m.offsetParent !== null || m.style.display !== 'none';
+    }""")
+    if not renew_modal_visible:
+        log.warning("⚠️ 续期弹窗未检测到（可能被广告弹窗遮挡或未弹出）")
+        return False
+
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 检查 CF 验证 widget 是否还在 loading 状态
         still_verifying = page.evaluate("""() => {
-            // 检查 CF Turnstile iframe 是否存在且处于验证中
             var frames = document.querySelectorAll('iframe');
             for (var f of frames) {
-                if (f.src && f.src.includes('challenges.cloudflare.com')) {
-                    return true;
-                }
+                if (f.src && f.src.includes('challenges.cloudflare.com')) return true;
             }
-            // 检查文本 "正在验证"
             var body = document.body.innerText || '';
             return body.includes('正在验证') || body.includes('Verifying');
         }""")
@@ -103,18 +199,13 @@ def wait_cf_turnstile(page, timeout=60) -> bool:
         if elapsed % 5 == 0:
             log.info(f"  CF 等待中... {elapsed}s")
         time.sleep(1)
+
     log.error(f"CF Turnstile 验证超时（{timeout}s）")
     return False
 
 # ---------- 登录 ----------
 def login(page, max_retries=3) -> bool:
-    """
-    Zampto 使用 Logto 登录，分两步：
-    1. 输入用户名/邮箱 → 点登录 → 跳转密码页
-    2. 输入密码 → 点继续 → 跳转 dash
-    """
-    # 构造带 app_id 的登录 URL（从图片中获取）
-    login_url = f"https://auth.zampto.net/sign-in?app_id=bmhk6c8qdqxphlyscztgl"
+    login_url = "https://auth.zampto.net/sign-in?app_id=bmhk6c8qdqxphlyscztgl"
 
     for attempt in range(1, max_retries + 1):
         log.info(f"登录 {attempt}/{max_retries}")
@@ -123,7 +214,6 @@ def login(page, max_retries=3) -> bool:
         except Exception as e:
             log.warning(f"goto 异常: {e}")
 
-        # 等待用户名输入框
         try:
             page.wait_for_selector(
                 'input[name="identifier"], input[autocomplete="username email"]',
@@ -135,7 +225,6 @@ def login(page, max_retries=3) -> bool:
             time.sleep(2)
             continue
 
-        # 填写用户名
         try:
             user_el = page.locator('input[name="identifier"]').first
             user_el.click()
@@ -148,7 +237,6 @@ def login(page, max_retries=3) -> bool:
 
         human_delay()
 
-        # 点击登录按钮（第一步，只提交用户名）
         try:
             page.locator('button[name="submit"], button[type="submit"]').first.click()
             log.info("已点击登录按钮（第一步）")
@@ -156,7 +244,6 @@ def login(page, max_retries=3) -> bool:
             log.warning(f"点击登录失败: {e}")
             continue
 
-        # 等待密码页
         try:
             page.wait_for_selector(
                 'input[name="password"], input[autocomplete="current-password"]',
@@ -168,7 +255,6 @@ def login(page, max_retries=3) -> bool:
             take_screenshot(page, f"login_no_password_{attempt}")
             continue
 
-        # 填写密码
         try:
             pass_el = page.locator('input[name="password"]').first
             pass_el.click()
@@ -181,7 +267,6 @@ def login(page, max_retries=3) -> bool:
 
         human_delay()
 
-        # 点击继续按钮
         try:
             page.locator('button[name="submit"], button[type="submit"]').first.click()
             log.info("已点击继续按钮（第二步）")
@@ -189,13 +274,11 @@ def login(page, max_retries=3) -> bool:
             log.warning(f"点击继续失败: {e}")
             continue
 
-        # 等待跳转到 dash
         if wait_for_url_contains(page, "dash.zampto.net", 20):
             log.info("✅ 登录成功，已跳转到 dashboard")
             take_screenshot(page, "01_login_success")
             return True
 
-        # 有时会先跳到 overview 或 servers
         time.sleep(3)
         if "dash.zampto.net" in page.url or "zampto.net/server" in page.url:
             log.info("✅ 登录成功")
@@ -208,48 +291,14 @@ def login(page, max_retries=3) -> bool:
 
     return False
 
-# ---------- 关闭 GDPR/Cookie 同意弹窗 ----------
-def dismiss_consent_modal(page):
-    """
-    登录后可能弹出 GDPR 同意框（德语 Einwilligen / Nicht einwilligen）。
-    直接点 Nicht einwilligen（不同意）关掉，不影响功能。
-    """
-    try:
-        page.wait_for_selector(
-            'button:has-text("Einwilligen"), button:has-text("Accept")',
-            timeout=6000
-        )
-        declined = page.evaluate("""() => {
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                var t = b.innerText.trim();
-                if (t === 'Nicht einwilligen' || t === 'Decline' || t === 'Reject') {
-                    b.click(); return 'declined';
-                }
-            }
-            var close = document.querySelector('button[aria-label="Close"], button[aria-label="close"]');
-            if (close) { close.click(); return 'closed'; }
-            return null;
-        }""")
-        if declined:
-            log.info(f"✅ 已关闭同意弹窗（{declined}）")
-            time.sleep(1)
-        else:
-            log.info("未找到拒绝按钮")
-    except Exception:
-        log.info("无 GDPR 弹窗，跳过")
-
-# ---------- 获取服务器信息 ----------
+# ---------- 获取服务器信息（expiry + 状态）----------
 def get_server_info(page, server_id: str) -> dict:
     """
-    访问服务器详情页，读取：
-    - Expiry (Next Renewal) 文本
-    - 服务器地址
+    访问服务器详情页读取 expiry / lastRenewed / address，
     然后访问 console 页读取真实运行状态（Running / Stopped）。
     """
     server_url = f"{BASE_URL}/server?id={server_id}"
     log.info(f"访问服务器详情: {server_url}")
-
     try:
         page.goto(server_url, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
@@ -259,25 +308,18 @@ def get_server_info(page, server_id: str) -> dict:
     take_screenshot(page, "02_server_page")
 
     info = page.evaluate("""() => {
-        var body = document.body.innerText || document.body.textContent || '';
-
-        // 提取 Expiry 信息（如 "1 day 23h 53m"）
-        var expiryMatch = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
-        var expiry = expiryMatch ? expiryMatch[1].trim() : null;
-
-        // 提取 Last Renewed 时间
+        var body = document.body.innerText || '';
+        var expiryMatch  = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
         var renewedMatch = body.match(/last renewed[^:]*:\\s*([^\\n]+)/i);
-        var lastRenewed = renewedMatch ? renewedMatch[1].trim() : null;
-
-        // 提取服务器地址
-        var addrMatch = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
-        var address = addrMatch ? addrMatch[0] : null;
-
-        return { expiry, lastRenewed, address };
+        var addrMatch    = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
+        return {
+            expiry:      expiryMatch  ? expiryMatch[1].trim()  : null,
+            lastRenewed: renewedMatch ? renewedMatch[1].trim() : null,
+            address:     addrMatch    ? addrMatch[0]           : null,
+        };
     }""")
 
-    # ✅ 修复：真实运行状态在 Console 页面，不在 server 详情页
-    # server 详情页显示的是账号"Active"状态，不是服务器运行状态
+    # 真实运行状态在 Console 页（server 详情页显示的是账号 Active，不是运行状态）
     console_url = f"{BASE_URL}/server-console?id={server_id}"
     log.info(f"访问 Console 页读取运行状态: {console_url}")
     try:
@@ -288,15 +330,10 @@ def get_server_info(page, server_id: str) -> dict:
     time.sleep(3)
 
     status_text = page.evaluate("""() => {
-        // Console 页面用 id="serverStatus" 显示运行状态
         var statusEl = document.getElementById('serverStatus');
         if (statusEl) return statusEl.innerText.trim();
-
-        // 备用：class 含 status-running / status-stopped
-        var runEl = document.querySelector('.status-running, .status-stopped, .status-starting');
+        var runEl = document.querySelector('.status-running,.status-stopped,.status-starting');
         if (runEl) return runEl.innerText.trim();
-
-        // 备用：从 body 文本匹配
         var body = document.body.innerText || '';
         var sm = body.match(/Running(?:\\s*\\([^)]+\\))?|Stopped|Starting|Stopping/i);
         return sm ? sm[0] : 'Unknown';
@@ -308,27 +345,12 @@ def get_server_info(page, server_id: str) -> dict:
 
 # ---------- 启动服务器 ----------
 def start_server(page) -> bool:
-    """点击 Console 页面的 Start 按钮启动服务器"""
-    # 找到 Console 链接并进入
-    try:
-        console_btn = page.locator('a[href*="server-console"], button:has-text("Console")').first
-        if console_btn.is_visible(timeout=5000):
-            console_btn.click()
-            log.info("已点击 Console 按钮")
-            time.sleep(3)
-        else:
-            raise Exception("Console 按钮不可见")
-    except:
-        # 直接构造 console URL
-        server_id = SERVER_ID
-        console_url = f"{BASE_URL}/server-console?id={server_id}"
-        log.info(f"直接导航到 Console: {console_url}")
-        page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
-        time.sleep(3)
-
+    console_url = f"{BASE_URL}/server-console?id={SERVER_ID}"
+    log.info(f"直接导航到 Console: {console_url}")
+    page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
+    time.sleep(3)
     take_screenshot(page, "03_console_page")
 
-    # 点击 Start 按钮
     try:
         start_btn = page.locator('button:has-text("Start")').first
         if start_btn.is_visible(timeout=5000):
@@ -336,13 +358,10 @@ def start_server(page) -> bool:
             log.info("✅ 已点击 Start 按钮")
             time.sleep(5)
             take_screenshot(page, "04_after_start")
-
-            # 验证是否正在启动
             body = get_text(page)
             if "Running" in body or "Starting" in body:
                 log.info("✅ 服务器正在启动")
-                return True
-            return True  # 点击成功即视为操作成功
+            return True
         else:
             log.warning("Start 按钮不可见（服务器可能已在运行）")
             return False
@@ -351,13 +370,15 @@ def start_server(page) -> bool:
         return False
 
 # ---------- 续期 ----------
-def renew_server(page, server_id: str) -> bool:
+def renew_server(page, server_id: str, expiry_before: str) -> bool:
     """
-    点击 Renew Server 按钮，等待 CF Turnstile 验证自动通过。
+    访问服务器详情页，关掉所有弹窗后点击 Renew Server，
+    等待 CF Turnstile 自动通过，最后用 expiry 是否增加来验证续期成功。
+
+    expiry_before: 续期前的 expiry 字符串，用于对比判断是否真正续期成功。
     """
     server_url = f"{BASE_URL}/server?id={server_id}"
     log.info(f"准备续期，访问: {server_url}")
-
     try:
         page.goto(server_url, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
@@ -365,17 +386,22 @@ def renew_server(page, server_id: str) -> bool:
 
     time.sleep(3)
 
-    # ✅ 修复：Renew Server 是 <a> 标签（onclick），不是 <button>
-    # 原代码 page.locator('button:has-text("Renew Server")') 永远找不到
+    # ✅ 关掉所有弹窗（广告/GDPR）再操作，避免广告弹窗拦截点击
+    log.info("关闭页面上所有弹窗...")
+    dismiss_all_popups(page)
+    time.sleep(1)
+
+    # 点击 Renew Server（<a> 标签，onclick，不是 <button>）
     try:
         renew_btn = page.locator(
             'a:has-text("Renew Server"), button:has-text("Renew Server")'
         ).first
         if not renew_btn.is_visible(timeout=8000):
-            # 尝试滚动到按钮
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1)
-            renew_btn = page.locator('button:has-text("Renew Server")').first
+            renew_btn = page.locator(
+                'a:has-text("Renew Server"), button:has-text("Renew Server")'
+            ).first
 
         renew_btn.click()
         log.info("已点击 Renew Server 按钮")
@@ -386,40 +412,42 @@ def renew_server(page, server_id: str) -> bool:
 
     time.sleep(2)
 
-    # 等待弹窗出现
-    try:
-        page.wait_for_selector(
-            'text="Renew Server", text="Please complete the security verification"',
-            timeout=10000
-        )
-        log.info("续期弹窗已出现")
-    except:
-        log.warning("未检测到续期弹窗，继续等待 CF 验证")
+    # 如果续期弹窗出现前又跳出广告，再清一次
+    dismiss_all_popups(page)
+    time.sleep(1)
 
     take_screenshot(page, "06_renew_modal")
 
-    # 等待 CF Turnstile 验证（CloakBrowser 会自动处理）
+    # 等待 CF Turnstile 验证（会先检查 renewModal 是否真的出现）
     if not wait_cf_turnstile(page, timeout=60):
-        log.warning("CF 验证超时，续期可能失败")
+        log.warning("CF 验证超时或续期弹窗未出现，续期失败")
         take_screenshot(page, "06_cf_timeout")
         return False
 
-    # 等待续期完成（弹窗消失或页面刷新）
-    time.sleep(3)
+    # 等待页面刷新 / 弹窗消失
+    time.sleep(5)
     take_screenshot(page, "07_after_renew")
 
-    # 检查是否续期成功（弹窗消失 or 页面刷新后 expiry 更新）
-    body = get_text(page)
-    modal_gone = page.evaluate("""() => {
-        var modal = document.querySelector('[class*="modal"], [class*="Modal"]');
-        return !modal || modal.style.display === 'none';
+    # ✅ 用 expiry 是否增加来判断是否真正续期成功，不依赖弹窗状态
+    info_after = page.evaluate("""() => {
+        var body = document.body.innerText || '';
+        var m = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
+        return m ? m[1].trim() : null;
     }""")
+    log.info(f"续期后 expiry（页面直读）: {info_after}")
 
-    if modal_gone or "Cancel" not in body:
-        log.info("✅ 续期完成（弹窗已关闭）")
+    minutes_before = parse_expiry_minutes(expiry_before)
+    minutes_after  = parse_expiry_minutes(info_after)
+
+    log.info(f"续期前 expiry 分钟数: {minutes_before}, 续期后: {minutes_after}")
+
+    # 成功条件：续期后时间 > 续期前时间（增加了说明成功），或续期后时间接近2天（>= 23h）
+    if minutes_after > minutes_before or minutes_after >= 23 * 60:
+        log.info(f"✅ 续期成功！expiry: {expiry_before} → {info_after}")
         return True
 
-    log.warning("续期弹窗仍在，可能未完成")
+    # 如果数值没变或变小，可能真的没续期成功
+    log.warning(f"⚠️ 续期后 expiry 未增加（{expiry_before} → {info_after}），续期可能失败")
     return False
 
 # ---------- 主流程 ----------
@@ -431,7 +459,6 @@ def main():
         wxpush("❌ 未配置 ZAMPTO_SERVER_ID，任务中止")
         return
 
-    # 代理：Xray 本地 SOCKS5（GitHub Actions 环境通过 V2RAY_CONFIG 启动）
     PROXY_SERVER = "socks5://127.0.0.1:10808"
 
     log.info("启动 CloakBrowser...")
@@ -449,8 +476,8 @@ def main():
             wxpush("❌ Zampto 登录失败，请检查账号密码")
             return
 
-        # 2. 关闭 GDPR 同意弹窗（如有）
-        dismiss_consent_modal(page)
+        # 2. 关闭 GDPR 同意弹窗
+        dismiss_all_popups(page)
 
         # 3. 获取服务器信息
         info = get_server_info(page, SERVER_ID)
@@ -461,7 +488,7 @@ def main():
 
         log.info(f"服务器状态: {status} | 到期: {expiry} | 地址: {address}")
 
-        # 3. 如果服务器 Stopped，执行启动
+        # 4. 如果服务器已停止，先启动
         started = False
         if "stopped" in status.lower() or "offline" in status.lower():
             log.info("🔴 服务器已停止，尝试启动...")
@@ -470,40 +497,34 @@ def main():
                 status = "Starting → Running"
                 log.info("✅ 已发送启动指令")
 
-        # 4. 续期
-        renewed = False
-        server_url = f"{BASE_URL}/server?id={SERVER_ID}"
-        page.goto(server_url, timeout=30000, wait_until="domcontentloaded")
-        time.sleep(3)
-        renewed = renew_server(page, SERVER_ID)
+        # 5. 续期（传入续期前 expiry 用于对比验证）
+        renewed = renew_server(page, SERVER_ID, expiry_before=expiry)
 
-        # 5. 续期后重新读取最新 expiry
+        # 6. 续期后重新读取最新 expiry
+        new_expiry = expiry
         if renewed:
             time.sleep(3)
             info2 = get_server_info(page, SERVER_ID)
-            new_expiry = info2.get("expiry", expiry)
-            if new_expiry:
-                expiry = new_expiry
-            log.info(f"续期后到期信息: {expiry}")
+            new_expiry = info2.get("expiry") or expiry
+            log.info(f"续期后到期信息: {new_expiry}")
 
-        # 6. 组装推送消息
+        # 7. 推送
         lines = ["🖥️ Zampto 服务器日报"]
         lines.append(f"服务器 ID: {SERVER_ID}")
         lines.append(f"地址: {address}")
         lines.append("")
-
-        # 状态
         status_icon = "🟢" if "running" in status.lower() else ("🟡" if "starting" in status.lower() else "🔴")
         lines.append(f"状态: {status_icon} {status}")
         if started:
             lines.append("  → 已自动触发启动 ✅")
-
         lines.append("")
-        lines.append(f"Expiry (Next Renewal): {expiry}")
+        lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
             lines.append(f"Last Renewed: {last_renew}")
         if renewed:
             lines.append("  → 已自动续期 ✅")
+        else:
+            lines.append("  ⚠️ 续期失败，请手动检查")
 
         msg = "\n".join(lines)
         log.info(f"推送内容:\n{msg}")
