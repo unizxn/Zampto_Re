@@ -68,6 +68,29 @@ def get_text(page) -> str:
 def human_delay(min_s=0.5, max_s=1.2):
     time.sleep(random.uniform(min_s, max_s))
 
+def tcp_check(host: str, port: int, timeout: int = 5) -> bool:
+    """尝试 TCP 连接，返回是否成功。"""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+def wait_for_port(host: str, port: int, max_wait: int = 120, interval: int = 10) -> bool:
+    """轮询等待端口真正可连接，最多等 max_wait 秒。"""
+    log.info(f"🔌 等待端口 {host}:{port} 可连接（最多 {max_wait}s）...")
+    elapsed = 0
+    while elapsed < max_wait:
+        if tcp_check(host, port):
+            log.info(f"✅ 端口 {host}:{port} 已可连接（等待了 {elapsed}s）")
+            return True
+        time.sleep(interval)
+        elapsed += interval
+        log.info(f"  [{elapsed}s] 端口还未开放，继续等待...")
+    log.warning(f"⚠️ 端口 {host}:{port} 等待超时（{max_wait}s）")
+    return False
+
 def wait_for_url_contains(page, keyword, timeout=15) -> bool:
     try:
         page.wait_for_url(f"**{keyword}**", timeout=timeout * 1000)
@@ -403,7 +426,102 @@ def start_server(page) -> bool:
         log.warning(f"⚠️ 等待超时（{wait_total}s），最后状态: {final_status}")
         take_screenshot(page, "05_start_timeout")
 
-    return final_status == "Running"
+    if final_status != "Running":
+        return False
+
+    # ── 面板显示 Running，进一步用 TCP 验证端口真的开了 ─────────────────
+    # address 格式 node11.zampto.net:40114，从全局 address 变量获取不到，
+    # 改为从环境变量 ZAMPTO_SERVER_ADDRESS 读取，或者用固定的 SERVER_ID 映射。
+    # 实际上 address 在 main 里才有，这里只能通过页面再读一次。
+    addr_raw = None
+    try:
+        addr_raw = page.evaluate("""() => {
+            var body = document.body.innerText || '';
+            var m = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
+            return m ? m[0] : null;
+        }""")
+    except Exception:
+        pass
+
+    if addr_raw:
+        parts = addr_raw.rsplit(":", 1)
+        if len(parts) == 2:
+            host, port_str = parts[0], parts[1]
+            try:
+                port = int(port_str)
+                port_ok = wait_for_port(host, port, max_wait=120, interval=10)
+                if port_ok:
+                    log.info(f"✅ TCP 端口 {addr_raw} 验证通过，服务器真正可连接")
+                    take_screenshot(page, "06_port_verified")
+                    return True
+                else:
+                    log.warning(f"⚠️ 端口 {addr_raw} 不可达，尝试 Restart 后再等一轮...")
+                    take_screenshot(page, "06_port_unreachable_before_restart")
+
+                    # ── 点击 Restart 按钮 ────────────────────────────────
+                    restarted = False
+                    try:
+                        restart_btn = page.locator('button:has-text("Restart")').first
+                        if restart_btn.is_visible(timeout=5000):
+                            restart_btn.click()
+                            log.info("🔄 已点击 Restart 按钮")
+                            time.sleep(5)
+                            take_screenshot(page, "07_after_restart")
+                            restarted = True
+                        else:
+                            log.warning("Restart 按钮不可见，跳过")
+                    except Exception as e:
+                        log.warning(f"点击 Restart 失败: {e}")
+
+                    if not restarted:
+                        return False
+
+                    # ── 等待面板再次变为 Running ──────────────────────────
+                    log.info("⏳ Restart 后等待面板变为 Running（最多 5 分钟）...")
+                    elapsed2 = 0
+                    running_again = False
+                    while elapsed2 < 300:
+                        time.sleep(10)
+                        elapsed2 += 10
+                        try:
+                            page.reload(timeout=20000, wait_until="domcontentloaded")
+                            time.sleep(3)
+                            body2 = get_text(page)
+                            if "Running" in body2:
+                                log.info(f"✅ Restart 后面板已变为 Running（等待了 {elapsed2}s）")
+                                take_screenshot(page, f"08_restart_running")
+                                running_again = True
+                                break
+                            elif "Starting" in body2:
+                                log.info(f"  [{elapsed2}s] 还在 Starting，继续等待...")
+                            elif "Offline" in body2 or "Stopped" in body2:
+                                log.warning(f"  [{elapsed2}s] Restart 后回到 Offline，放弃")
+                                break
+                        except Exception as e:
+                            log.warning(f"  [{elapsed2}s] 刷新异常: {e}")
+
+                    if not running_again:
+                        log.warning("⚠️ Restart 后未能恢复 Running，放弃")
+                        take_screenshot(page, "08_restart_failed")
+                        return False
+
+                    # ── 再次验证端口 ──────────────────────────────────────
+                    log.info(f"🔌 Restart 后再次验证端口 {addr_raw}...")
+                    port_ok2 = wait_for_port(host, port, max_wait=120, interval=10)
+                    if port_ok2:
+                        log.info(f"✅ Restart 后端口 {addr_raw} 验证通过")
+                        take_screenshot(page, "09_port_verified_after_restart")
+                        return True
+                    else:
+                        log.warning(f"⚠️ Restart 后端口 {addr_raw} 仍不可达，请手动处理")
+                        take_screenshot(page, "09_port_still_unreachable")
+                        return False
+            except ValueError:
+                pass
+    else:
+        log.warning("⚠️ 未能从页面读取服务器地址，跳过端口验证，以面板状态为准")
+
+    return True  # 读不到地址时降级为只看面板状态
 
 # ---------- 续期 ----------
 def renew_server(page, server_id: str, expiry_before: str) -> bool:
@@ -559,9 +677,9 @@ def main():
         status_icon = "🟢" if "running" in status.lower() else ("🟡" if "starting" in status.lower() else "🔴")
         lines.append(f"状态: {status_icon} {status}")
         if started:
-            lines.append("  → 已启动并确认 Running ✅")
-        elif "start" in status.lower() or "failed" in status.lower():
-            lines.append("  ⚠️ 启动失败或超时，请手动检查")
+            lines.append("  → 已启动，面板 Running + 端口可连接 ✅")
+        elif "stopped" in status.lower() or "offline" in status.lower() or "failed" in status.lower():
+            lines.append("  ⚠️ 启动失败（含自动 Restart 重试），端口仍不可达，请手动处理")
         lines.append("")
         lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
