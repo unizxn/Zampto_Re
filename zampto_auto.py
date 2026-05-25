@@ -208,6 +208,37 @@ def login(page, max_retries=3) -> bool:
 
     return False
 
+# ---------- 关闭 GDPR/Cookie 同意弹窗 ----------
+def dismiss_consent_modal(page):
+    """
+    登录后可能弹出 GDPR 同意框（德语 Einwilligen / Nicht einwilligen）。
+    直接点 Nicht einwilligen（不同意）关掉，不影响功能。
+    """
+    try:
+        page.wait_for_selector(
+            'button:has-text("Einwilligen"), button:has-text("Accept")',
+            timeout=6000
+        )
+        declined = page.evaluate("""() => {
+            var btns = document.querySelectorAll('button');
+            for (var b of btns) {
+                var t = b.innerText.trim();
+                if (t === 'Nicht einwilligen' || t === 'Decline' || t === 'Reject') {
+                    b.click(); return 'declined';
+                }
+            }
+            var close = document.querySelector('button[aria-label="Close"], button[aria-label="close"]');
+            if (close) { close.click(); return 'closed'; }
+            return null;
+        }""")
+        if declined:
+            log.info(f"✅ 已关闭同意弹窗（{declined}）")
+            time.sleep(1)
+        else:
+            log.info("未找到拒绝按钮")
+    except Exception:
+        log.info("无 GDPR 弹窗，跳过")
+
 # ---------- 获取服务器信息 ----------
 def get_server_info(page, server_id: str) -> dict:
     """
@@ -397,7 +428,10 @@ def main():
             wxpush("❌ Zampto 登录失败，请检查账号密码")
             return
 
-        # 2. 获取服务器信息
+        # 2. 关闭 GDPR 同意弹窗（如有）
+        dismiss_consent_modal(page)
+
+        # 3. 获取服务器信息
         info = get_server_info(page, SERVER_ID)
         status     = info.get("status", "Unknown")
         expiry     = info.get("expiry", "未知")
