@@ -50,10 +50,45 @@ def wxpush(content: str):
         log.warning(f"📨 WxPusher 推送异常: {e}")
 
 # ---------- 工具函数 ----------
+def redact_sensitive_info(page):
+    """截图前将页面上的邮箱地址替换为 *** 遮码，截图后恢复原始文本。"""
+    try:
+        page.evaluate("""() => {
+            // 遍历所有文本节点，找到邮箱并用 *** 替换显示
+            const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+            function maskNode(node) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    if (emailRegex.test(node.textContent)) {
+                        node.textContent = node.textContent.replace(emailRegex, '***@***.***');
+                    }
+                } else {
+                    // 跳过 script/style 标签
+                    if (node.tagName && ['SCRIPT','STYLE','NOSCRIPT'].includes(node.tagName)) return;
+                    node.childNodes.forEach(maskNode);
+                }
+            }
+            // 重置正则 lastIndex
+            emailRegex.lastIndex = 0;
+            document.querySelectorAll('body *').forEach(el => {
+                // 只处理直接文本内容（避免重复处理子节点）
+                el.childNodes.forEach(child => {
+                    if (child.nodeType === Node.TEXT_NODE && emailRegex.test(child.textContent)) {
+                        emailRegex.lastIndex = 0;
+                        child.textContent = child.textContent.replace(emailRegex, '***@***.***');
+                    }
+                    emailRegex.lastIndex = 0;
+                });
+            });
+        }""")
+    except Exception as e:
+        log.warning(f"遮码邮箱失败: {e}")
+
+
 def take_screenshot(page, name):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
+        redact_sensitive_info(page)
         page.screenshot(path=path, full_page=False)
         log.info(f"📸 截图: {path}")
     except Exception as e:
