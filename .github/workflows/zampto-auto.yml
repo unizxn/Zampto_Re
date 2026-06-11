@@ -26,7 +26,7 @@ jobs:
   zampto-auto:
     name: 检查状态 / 自动续期
     runs-on: ubuntu-latest
-    timeout-minins: 20
+    timeout-minutes: 20
 
     steps:
       - name: 检出代码
