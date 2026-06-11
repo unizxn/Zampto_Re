@@ -10,7 +10,7 @@ on:
         required: false
         default: '手动测试'
       enable_recording:
-        description: '启用录屏（true=录制操作视频，false=不录制）'
+        description: '录屏（true=录屏，false=不录屏）'
         required: false
         default: 'false'
         type: choice
@@ -59,7 +59,7 @@ jobs:
           ./xray run -c config.json &
           sleep 5
           echo "直连 IP：$(curl -s --max-time 5 ifconfig.me || echo '失败')"
-          echo "代理 IP：$(curl -s --max-time 10 --socks5 127.0.0.1:10808 ifconfig.me || echo '代理失败')"
+          echo "代理 IP：$(curl -s --max-time 10 --socks5 127.0.0.1:10808 ifconfig.me || echo '代理失败，请检查 V2RAY_CONFIG')"
 
       - name: 打印触发原因
         run: echo "触发原因：${{ github.event.client_payload.reason || github.event.inputs.reason || 'Uptime Kuma 检测到离线' }}"
@@ -74,6 +74,7 @@ jobs:
           SKIP_RENEW:       "true"
           UPTIME_STATUS:    ${{ github.event.client_payload.status }}
           UPTIME_HEARTBEAT: ${{ toJson(github.event.client_payload.heartbeat) }}
+          ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
           DISPLAY:          ":99"
           LIBGL_ALWAYS_SOFTWARE: "1"
           GALLIUM_DRIVER:   "llvmpipe"
@@ -83,8 +84,8 @@ jobs:
           sleep 2
 
           RECORD_PID=""
-          if [ "${{ github.event.inputs.enable_recording || 'false' }}" = "true" ]; then
-            echo "🎥 录屏已启用"
+          if [ "$ENABLE_RECORDING" = "true" ]; then
+            echo "🎬 录屏已启用"
             ffmpeg -f x11grab -video_size 1280x720 -framerate 10 -i :99 \
               -codec:v libx264 -preset ultrafast -crf 30 \
               -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
@@ -92,16 +93,14 @@ jobs:
             RECORD_PID=$!
             sleep 2
           else
-            echo "🎥 录屏已禁用（可在手动触发时将 enable_recording 设为 true）"
+            echo "🎬 录屏未启用（如需录屏，手动触发时选择 enable_recording=true）"
           fi
 
           timeout 600 python zampto_auto.py || echo "脚本退出码: $?"
 
           sleep 2
-          if [ -n "$RECORD_PID" ]; then
-            kill $RECORD_PID 2>/dev/null || true
-            wait $RECORD_PID 2>/dev/null || true
-          fi
+          [ -n "$RECORD_PID" ] && kill $RECORD_PID 2>/dev/null || true
+          [ -n "$RECORD_PID" ] && wait $RECORD_PID 2>/dev/null || true
           kill $XVFB_PID 2>/dev/null || true
 
       - name: 上传截图和录屏
@@ -111,11 +110,10 @@ jobs:
           name: emergency-${{ github.run_number }}
           path: |
             ./screenshots/*.png
-            /tmp/recording.mp4
-            /tmp/ffmpeg.log
+            ${{ github.event.inputs.enable_recording == 'true' && '/tmp/recording.mp4' || '' }}
+            ${{ github.event.inputs.enable_recording == 'true' && '/tmp/ffmpeg.log' || '' }}
           if-no-files-found: ignore
           retention-days: 3
-          # 注意：若 enable_recording=false，recording.mp4 不会生成，上传时自动忽略
 
       - name: 清理旧运行记录（只保留最新 3 条）
         if: always()
