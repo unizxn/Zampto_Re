@@ -50,45 +50,10 @@ def wxpush(content: str):
         log.warning(f"📨 WxPusher 推送异常: {e}")
 
 # ---------- 工具函数 ----------
-def redact_sensitive_info(page):
-    """截图前将页面上的邮箱地址替换为 *** 遮码，截图后恢复原始文本。"""
-    try:
-        page.evaluate("""() => {
-            // 遍历所有文本节点，找到邮箱并用 *** 替换显示
-            const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
-            function maskNode(node) {
-                if (node.nodeType === Node.TEXT_NODE) {
-                    if (emailRegex.test(node.textContent)) {
-                        node.textContent = node.textContent.replace(emailRegex, '***@***.***');
-                    }
-                } else {
-                    // 跳过 script/style 标签
-                    if (node.tagName && ['SCRIPT','STYLE','NOSCRIPT'].includes(node.tagName)) return;
-                    node.childNodes.forEach(maskNode);
-                }
-            }
-            // 重置正则 lastIndex
-            emailRegex.lastIndex = 0;
-            document.querySelectorAll('body *').forEach(el => {
-                // 只处理直接文本内容（避免重复处理子节点）
-                el.childNodes.forEach(child => {
-                    if (child.nodeType === Node.TEXT_NODE && emailRegex.test(child.textContent)) {
-                        emailRegex.lastIndex = 0;
-                        child.textContent = child.textContent.replace(emailRegex, '***@***.***');
-                    }
-                    emailRegex.lastIndex = 0;
-                });
-            });
-        }""")
-    except Exception as e:
-        log.warning(f"遮码邮箱失败: {e}")
-
-
 def take_screenshot(page, name):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
-        redact_sensitive_info(page)
         page.screenshot(path=path, full_page=False)
         log.info(f"📸 截图: {path}")
     except Exception as e:
@@ -153,62 +118,131 @@ def parse_expiry_minutes(expiry_str: str) -> int:
         total += int(m.group(1))
     return total if total > 0 else -1
 
-# ---------- 关闭所有弹窗（广告 + GDPR）----------
+# ---------- 关闭所有弹窗（广告 + GDPR + Google Vignette）----------
 def dismiss_all_popups(page):
     """
     关闭页面上所有可能出现的弹窗：
-    1. 广告弹窗（有 Close 按钮，或含外部域名链接）
-    2. GDPR Cookie 同意弹窗
-    每次调用最多等待 5 秒，关掉后继续检测，最多循环 3 轮。
+    1. Google Vignette 广告（iframe 形式，需 JS 隐藏）
+    2. 普通广告弹窗（有 Close 按钮）
+    3. GDPR Cookie 同意弹窗
+    每次调用最多循环 4 轮，每轮间隔 0.8 秒。
     """
-    for round_idx in range(3):
+    for round_idx in range(4):
         closed_any = False
 
+        # ── Step A：用 JS 强制隐藏 Google Vignette iframe 及全屏遮罩 ──────
+        hidden = page.evaluate("""() => {
+            var count = 0;
+
+            // Google Vignette iframe（id 含 google_vignette 或 aswift）
+            document.querySelectorAll('iframe').forEach(function(f) {
+                if ((f.id && (f.id.includes('google_vignette') || f.id.includes('aswift'))) ||
+                    (f.name && f.name.includes('google_vignette'))) {
+                    // 隐藏 iframe 自身
+                    f.style.setProperty('display', 'none', 'important');
+                    // 隐藏其父容器（通常是 ins 或 div 包装）
+                    if (f.parentElement) {
+                        f.parentElement.style.setProperty('display', 'none', 'important');
+                        if (f.parentElement.parentElement) {
+                            f.parentElement.parentElement.style.setProperty('display', 'none', 'important');
+                        }
+                    }
+                    count++;
+                }
+            });
+
+            // 全屏固定遮罩（z-index 高的 fixed div，排除 renewModal 等正常弹窗）
+            document.querySelectorAll('div[style*="position: fixed"], div[style*="position:fixed"]').forEach(function(ov) {
+                if (!ov.offsetParent && ov.style.display === 'none') return;
+                var z = parseInt(window.getComputedStyle(ov).zIndex) || 0;
+                if (z >= 9000 && !ov.id.includes('renew') && !ov.id.includes('modal')) {
+                    ov.style.setProperty('display', 'none', 'important');
+                    count++;
+                }
+            });
+
+            // ins.adsbygoogle 广告容器
+            document.querySelectorAll('ins.adsbygoogle').forEach(function(ins) {
+                ins.style.setProperty('display', 'none', 'important');
+                count++;
+            });
+
+            return count;
+        }""")
+        if hidden and hidden > 0:
+            log.info(f"  [轮{round_idx+1}] JS 隐藏 {hidden} 个广告/遮罩元素")
+            closed_any = True
+
+        # ── Step B：点击页面内关闭按钮 ──────────────────────────────────
         closed = page.evaluate("""() => {
             var count = 0;
 
-            // ① 优先找带明确文字的关闭按钮
-            var closeTexts = ['Close', 'close', 'Schließen', '×', 'X'];
+            // ① 带明确文字的关闭按钮（在弹窗容器内）
+            var closeTexts = ['Close', 'close', 'Schließen', '×', 'X', 'CLOSE'];
             for (var t of closeTexts) {
                 var btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
                 for (var b of btns) {
                     if (b.innerText && b.innerText.trim() === t) {
-                        // 确认它在某种弹窗/overlay 容器内
-                        var parent = b.closest('[class*="modal"],[class*="popup"],[class*="overlay"],[class*="dialog"],[class*="ad-"]');
-                        if (parent) { b.click(); count++; break; }
+                        var parent = b.closest('[class*="modal"],[class*="popup"],[class*="overlay"],[class*="dialog"],[class*="ad-"],[class*="vignette"]');
+                        if (parent && parent.offsetParent !== null) { b.click(); count++; break; }
                     }
                 }
             }
 
-            // ② aria-label="Close" 的按钮
-            var ariaClose = document.querySelector('button[aria-label="Close"], button[aria-label="close"], [aria-label="Dismiss"]');
-            if (ariaClose) { ariaClose.click(); count++; }
+            // ② aria-label="Close" / "Dismiss"
+            var ariaClose = document.querySelector(
+                'button[aria-label="Close"], button[aria-label="close"], ' +
+                '[aria-label="Dismiss"], button[aria-label="CLOSE"]'
+            );
+            if (ariaClose && ariaClose.offsetParent !== null) { ariaClose.click(); count++; }
 
-            // ③ GDPR：Nicht einwilligen / Decline / Reject
-            var gdprTexts = ['Nicht einwilligen', 'Decline', 'Reject'];
+            // ③ GDPR：Nicht einwilligen / Decline / Reject / Do not consent
+            var gdprTexts = ['Nicht einwilligen', 'Decline', 'Reject', 'Do not consent'];
             for (var gt of gdprTexts) {
                 var gb = Array.from(document.querySelectorAll('button')).find(b => b.innerText.trim() === gt);
-                if (gb) { gb.click(); count++; break; }
+                if (gb && gb.offsetParent !== null) { gb.click(); count++; break; }
+            }
+
+            // ④ Zampto continue-prompt / close-button-protector
+            var cpClose = document.querySelector(
+                '.close-button-protector, .dismiss-button, .dismiss-button-protector, ' +
+                '[class*="continue-prompt"] button, [class*="close-button-protector"]'
+            );
+            if (cpClose && cpClose.offsetParent !== null) { cpClose.click(); count++; }
+
+            // ⑤ 可见固定遮罩内的关闭按钮
+            var overlays = Array.from(document.querySelectorAll('div[style*="position: fixed"], div[style*="position:fixed"]'));
+            for (var ov of overlays) {
+                if (ov.offsetParent === null) continue;
+                if (ov.id && (ov.id.includes('renew') || ov.id.includes('modal'))) continue;
+                var closeBtn = ov.querySelector('button[class*="close"], button[aria-label*="lose"], a[class*="close"]');
+                if (closeBtn && closeBtn.offsetParent !== null) { closeBtn.click(); count++; break; }
             }
 
             return count;
         }""")
 
         if closed and closed > 0:
-            log.info(f"  已关闭 {closed} 个弹窗（第 {round_idx+1} 轮）")
+            log.info(f"  [轮{round_idx+1}] 已点击关闭 {closed} 个弹窗")
             closed_any = True
             time.sleep(1)
 
-        # 检查是否还有可见弹窗
+        # ── Step C：检查是否还有可见弹窗 ────────────────────────────────
         has_popup = page.evaluate("""() => {
+            // 排除 renewModal 和隐藏元素
             var selectors = [
-                '[class*="modal"]:not([style*="display: none"])',
+                '[class*="modal"]:not([id*="renew"]):not([style*="display: none"])',
                 '[class*="popup"]:not([style*="display: none"])',
-                '[class*="overlay"]:not([style*="display: none"])',
+                '[class*="vignette"]:not([style*="display: none"])',
             ];
             for (var s of selectors) {
                 var el = document.querySelector(s);
                 if (el && el.offsetParent !== null) return true;
+            }
+            // 检查是否还有可见的 Google 广告 iframe
+            var iframes = document.querySelectorAll('iframe');
+            for (var f of iframes) {
+                if ((f.id && f.id.includes('google_vignette')) && f.style.display !== 'none') return true;
             }
             return false;
         }""")
@@ -217,10 +251,9 @@ def dismiss_all_popups(page):
             break
 
         if not closed_any:
-            # 没关掉也没新弹窗，退出
             break
 
-        time.sleep(1)
+        time.sleep(0.8)
 
 # ---------- CF Turnstile 等待 ----------
 def wait_cf_turnstile(page, timeout=60) -> bool:
@@ -365,12 +398,14 @@ def get_server_info(page, server_id: str) -> dict:
 
     time.sleep(3)
     take_screenshot(page, "02_server_page")
+    dismiss_all_popups(page)
+    time.sleep(1)
 
     info = page.evaluate("""() => {
         var body = document.body.innerText || '';
-        var expiryMatch  = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
-        var renewedMatch = body.match(/last renewed[^:]*:\\s*([^\\n]+)/i);
-        var addrMatch    = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
+        var expiryMatch  = body.match(/Expiry[^:]*:\s*([^\n]+)/i);
+        var renewedMatch = body.match(/last renewed[^:]*:\s*([^\n]+)/i);
+        var addrMatch    = body.match(/node\d+\.zampto\.net:\d+/i);
         return {
             expiry:      expiryMatch  ? expiryMatch[1].trim()  : null,
             lastRenewed: renewedMatch ? renewedMatch[1].trim() : null,
@@ -387,6 +422,8 @@ def get_server_info(page, server_id: str) -> dict:
         log.warning(f"访问 Console 页超时: {e}")
 
     time.sleep(3)
+    dismiss_all_popups(page)
+    time.sleep(1)
 
     status_text = page.evaluate("""() => {
         var statusEl = document.getElementById('serverStatus');
@@ -394,7 +431,7 @@ def get_server_info(page, server_id: str) -> dict:
         var runEl = document.querySelector('.status-running,.status-stopped,.status-starting');
         if (runEl) return runEl.innerText.trim();
         var body = document.body.innerText || '';
-        var sm = body.match(/Running(?:\\s*\\([^)]+\\))?|Stopped|Starting|Stopping/i);
+        var sm = body.match(/Running(?:\s*\([^)]+\))?|Stopped|Starting|Stopping/i);
         return sm ? sm[0] : 'Unknown';
     }""")
 
@@ -402,79 +439,93 @@ def get_server_info(page, server_id: str) -> dict:
     log.info(f"服务器信息: expiry={info.get('expiry')}, status={info.get('status')}, address=<已隐藏>")
     return info
 
-# ---------- 启动服务器 ----------
+# ---------- 启动服务器（含多次重试）----------
 def start_server(page) -> bool:
     console_url = f"{BASE_URL}/server-console?id={SERVER_ID}"
-    log.info(f"直接导航到 Console 页")
-    page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
-    time.sleep(3)
-    take_screenshot(page, "03_console_page")
+    MAX_START_ATTEMPTS = 3  # 最多尝试点 Start 3 次
 
-    try:
-        start_btn = page.locator('button:has-text("Start")').first
-        if start_btn.is_visible(timeout=5000):
-            start_btn.click()
-            log.info("✅ 已点击 Start 按钮")
-            time.sleep(5)
-            take_screenshot(page, "04_after_start")
-        else:
-            log.warning("Start 按钮不可见（服务器可能已在运行）")
-            # 可能已经在 Running，继续等待确认
-    except Exception as e:
-        log.warning(f"点击 Start 失败: {e}")
-        return False
-
-    # ── 轮询等待服务器真正变为 Running ──────────────────────────────────
-    log.info("⏳ 等待服务器变为 Running（最多 5 分钟）...")
-    wait_total = 300   # 最多等 300 秒
-    poll_interval = 10  # 每 10 秒刷新一次
-    elapsed = 0
-    final_status = "Unknown"
-    # Zampto 启动流程：Offline → Starting → Running
-    # 点击 Start 后有短暂窗口期页面仍显示 Offline，需连续多次才确认失败
-    offline_tolerance = 3   # 连续检测到 Offline 超过此次数才认定失败
-    offline_streak = 0
-
-    while elapsed < wait_total:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
+    for attempt in range(1, MAX_START_ATTEMPTS + 1):
+        log.info(f"直接导航到 Console 页（第 {attempt}/{MAX_START_ATTEMPTS} 次尝试）")
         try:
-            page.reload(timeout=20000, wait_until="domcontentloaded")
-            time.sleep(3)
-            body = get_text(page)
-            # 优先匹配状态指示器文字
-            if "Running" in body:
-                final_status = "Running"
-                log.info(f"✅ 服务器已变为 Running（等待了 {elapsed}s）")
-                take_screenshot(page, f"05_running_confirmed")
-                offline_streak = 0
-                break
-            elif "Starting" in body:
-                final_status = "Starting"
-                offline_streak = 0
-                log.info(f"  [{elapsed}s] 还在 Starting，继续等待...")
-                take_screenshot(page, f"05_still_starting_{elapsed}s")
-            elif "Offline" in body or "Stopped" in body:
-                offline_streak += 1
-                final_status = "Offline"
-                log.warning(
-                    f"  [{elapsed}s] 检测到 Offline（第 {offline_streak}/{offline_tolerance} 次）"
-                )
-                take_screenshot(page, f"05_start_failed_{elapsed}s")
-                if offline_streak >= offline_tolerance:
-                    log.warning(
-                        f"  连续 {offline_streak} 次 Offline，确认启动失败，退出等待"
-                    )
-                    break
-                log.info(f"  Offline 容忍中，继续等待（可能仍处于启动窗口期）...")
-            else:
-                offline_streak = 0
-                log.info(f"  [{elapsed}s] 状态未知，继续等待...")
+            page.goto(console_url, timeout=30000, wait_until="domcontentloaded")
         except Exception as e:
-            log.warning(f"  [{elapsed}s] 刷新页面异常: {e}")
-    else:
-        log.warning(f"⚠️ 等待超时（{wait_total}s），最后状态: {final_status}")
-        take_screenshot(page, "05_start_timeout")
+            log.warning(f"导航 Console 页超时: {e}")
+        time.sleep(3)
+
+        if attempt == 1:
+            take_screenshot(page, "03_console_page")
+
+        # ── 先清弹窗，再点 Start ──────────────────────────────────────
+        dismiss_all_popups(page)
+        time.sleep(1)
+
+        try:
+            start_btn = page.locator('button:has-text("Start")').first
+            if start_btn.is_visible(timeout=5000):
+                start_btn.click()
+                log.info(f"✅ 已点击 Start 按钮（第 {attempt} 次）")
+                time.sleep(5)
+                take_screenshot(page, f"04_after_start_attempt{attempt}")
+            else:
+                body_now = get_text(page)
+                if "Running" in body_now:
+                    log.info("Start 按钮不可见，页面已显示 Running，跳过点击")
+                else:
+                    log.warning(f"Start 按钮不可见且状态不是 Running，第 {attempt} 次跳过")
+                    continue
+        except Exception as e:
+            log.warning(f"点击 Start 失败（第 {attempt} 次）: {e}")
+            continue
+
+        # ── 轮询等待服务器真正变为 Running ──────────────────────────────
+        log.info("⏳ 等待服务器变为 Running（最多 5 分钟）...")
+        wait_total = 300
+        poll_interval = 10
+        elapsed = 0
+        final_status = "Unknown"
+        offline_streak = 0
+
+        while elapsed < wait_total:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            try:
+                page.reload(timeout=20000, wait_until="domcontentloaded")
+                time.sleep(4)
+                dismiss_all_popups(page)
+                time.sleep(1)
+                body = get_text(page)
+                if "Running" in body:
+                    final_status = "Running"
+                    offline_streak = 0
+                    log.info(f"✅ 服务器已变为 Running（第 {attempt} 次尝试，等待了 {elapsed}s）")
+                    take_screenshot(page, f"05_running_confirmed_attempt{attempt}")
+                    break
+                elif "Starting" in body:
+                    final_status = "Starting"
+                    offline_streak = 0
+                    log.info(f"  [{elapsed}s] 还在 Starting，继续等待...")
+                elif "Offline" in body or "Stopped" in body:
+                    offline_streak += 1
+                    log.info(f"  [{elapsed}s] 读到 Offline（连续第 {offline_streak} 次），{'继续等待...' if offline_streak < 3 else '确认失败'}")
+                    if offline_streak >= 3:
+                        final_status = "Offline"
+                        take_screenshot(page, f"05_start_failed_attempt{attempt}_{elapsed}s")
+                        break
+                else:
+                    offline_streak = 0
+                    log.info(f"  [{elapsed}s] 状态未知，继续等待...")
+            except Exception as e:
+                log.warning(f"  [{elapsed}s] 刷新页面异常: {e}")
+        else:
+            log.warning(f"⚠️ 第 {attempt} 次等待超时（{wait_total}s），最后状态: {final_status}")
+            take_screenshot(page, f"05_start_timeout_attempt{attempt}")
+
+        if final_status == "Running":
+            break
+
+        if attempt < MAX_START_ATTEMPTS:
+            log.info(f"⏳ 第 {attempt} 次失败，{5}s 后重试...")
+            time.sleep(5)
 
     if final_status != "Running":
         return False
@@ -484,7 +535,7 @@ def start_server(page) -> bool:
     try:
         addr_raw = page.evaluate("""() => {
             var body = document.body.innerText || '';
-            var m = body.match(/node\\d+\\.zampto\\.net:\\d+/i);
+            var m = body.match(/node\d+\.zampto\.net:\d+/i);
             return m ? m[0] : null;
         }""")
     except Exception:
@@ -502,116 +553,68 @@ def start_server(page) -> bool:
                     take_screenshot(page, "06_port_verified")
                     return True
                 else:
-                    log.warning(f"⚠️ 端口不可达，改用 Stop → Start 彻底重启...")
-                    take_screenshot(page, "06_port_unreachable_before_stop_start")
+                    log.warning(f"⚠️ 端口不可达，尝试 Restart 后再等一轮...")
+                    take_screenshot(page, "06_port_unreachable_before_restart")
 
-                    # ── 第一步：点击 Stop 按钮 ───────────────────────────
-                    stopped = False
-                    try:
-                        stop_btn = page.locator('button:has-text("Stop")').first
-                        if stop_btn.is_visible(timeout=5000):
-                            stop_btn.click()
-                            log.info("🛑 已点击 Stop 按钮")
-                            take_screenshot(page, "07_after_stop")
-                            # 等待面板变为 Offline/Stopped（最多 60s）
-                            log.info("⏳ 等待服务器停止（最多 60s）...")
-                            for _ in range(6):
-                                time.sleep(10)
-                                try:
-                                    page.reload(timeout=20000, wait_until="domcontentloaded")
-                                    time.sleep(3)
-                                    body_s = get_text(page)
-                                    if "Offline" in body_s or "Stopped" in body_s:
-                                        log.info("✅ 服务器已停止")
-                                        stopped = True
-                                        break
-                                    log.info("  还未停止，继续等待...")
-                                except Exception as e:
-                                    log.warning(f"  刷新异常: {e}")
-                            if not stopped:
-                                log.warning("⚠️ Stop 后未确认 Offline，仍继续尝试 Start")
-                                stopped = True  # 强行继续
-                        else:
-                            log.warning("Stop 按钮不可见，跳过 Stop 步骤")
-                    except Exception as e:
-                        log.warning(f"点击 Stop 失败: {e}")
-
-                    if not stopped:
-                        return False
-
-                    # ── 第二步：等几秒让端口完全释放 ─────────────────────
-                    log.info("⏸️ 等待 8 秒让端口完全释放...")
-                    time.sleep(8)
-
-                    # ── 第三步：点击 Start 按钮 ──────────────────────────
+                    # ── 点击 Restart 按钮 ────────────────────────────────
                     restarted = False
                     try:
-                        start_btn2 = page.locator('button:has-text("Start")').first
-                        if start_btn2.is_visible(timeout=10000):
-                            start_btn2.click()
-                            log.info("▶️ 已点击 Start 按钮（Stop→Start 流程）")
+                        restart_btn = page.locator('button:has-text("Restart")').first
+                        if restart_btn.is_visible(timeout=5000):
+                            restart_btn.click()
+                            log.info("🔄 已点击 Restart 按钮")
                             time.sleep(5)
-                            take_screenshot(page, "08_after_stop_start")
+                            take_screenshot(page, "07_after_restart")
                             restarted = True
                         else:
-                            log.warning("Start 按钮不可见，无法重新启动")
+                            log.warning("Restart 按钮不可见，跳过")
                     except Exception as e:
-                        log.warning(f"点击 Start 失败: {e}")
+                        log.warning(f"点击 Restart 失败: {e}")
 
                     if not restarted:
                         return False
 
-                    # ── 第四步：等待面板变为 Running ──────────────────────
-                    log.info("⏳ Stop→Start 后等待面板变为 Running（最多 5 分钟）...")
+                    # ── 等待面板再次变为 Running ──────────────────────────
+                    log.info("⏳ Restart 后等待面板变为 Running（最多 5 分钟）...")
                     elapsed2 = 0
                     running_again = False
-                    offline_streak2 = 0
-                    offline_tolerance2 = 3  # 同样的容忍机制
                     while elapsed2 < 300:
                         time.sleep(10)
                         elapsed2 += 10
                         try:
                             page.reload(timeout=20000, wait_until="domcontentloaded")
                             time.sleep(3)
+                            dismiss_all_popups(page)
+                            time.sleep(1)
                             body2 = get_text(page)
                             if "Running" in body2:
-                                log.info(f"✅ Stop→Start 后面板已变为 Running（等待了 {elapsed2}s）")
-                                take_screenshot(page, "09_stop_start_running")
+                                log.info(f"✅ Restart 后面板已变为 Running（等待了 {elapsed2}s）")
+                                take_screenshot(page, f"08_restart_running")
                                 running_again = True
-                                offline_streak2 = 0
                                 break
                             elif "Starting" in body2:
-                                offline_streak2 = 0
                                 log.info(f"  [{elapsed2}s] 还在 Starting，继续等待...")
                             elif "Offline" in body2 or "Stopped" in body2:
-                                offline_streak2 += 1
-                                log.warning(
-                                    f"  [{elapsed2}s] 检测到 Offline（第 {offline_streak2}/{offline_tolerance2} 次）"
-                                )
-                                if offline_streak2 >= offline_tolerance2:
-                                    log.warning(
-                                        f"  连续 {offline_streak2} 次 Offline，确认 Stop→Start 启动失败，放弃"
-                                    )
-                                    break
-                                log.info(f"  Offline 容忍中，继续等待...")
+                                log.warning(f"  [{elapsed2}s] Restart 后回到 Offline，放弃")
+                                break
                         except Exception as e:
                             log.warning(f"  [{elapsed2}s] 刷新异常: {e}")
 
                     if not running_again:
-                        log.warning("⚠️ Stop→Start 后未能恢复 Running，放弃")
-                        take_screenshot(page, "09_stop_start_failed")
+                        log.warning("⚠️ Restart 后未能恢复 Running，放弃")
+                        take_screenshot(page, "08_restart_failed")
                         return False
 
-                    # ── 第五步：再次验证端口 ──────────────────────────────
-                    log.info(f"🔌 Stop→Start 后再次验证端口...")
+                    # ── 再次验证端口 ──────────────────────────────────────
+                    log.info(f"🔌 Restart 后再次验证端口...")
                     port_ok2 = wait_for_port(host, port, max_wait=120, interval=10)
                     if port_ok2:
-                        log.info(f"✅ Stop→Start 后端口验证通过")
-                        take_screenshot(page, "10_port_verified_after_stop_start")
+                        log.info(f"✅ Restart 后端口验证通过")
+                        take_screenshot(page, "09_port_verified_after_restart")
                         return True
                     else:
-                        log.warning(f"⚠️ Stop→Start 后端口仍不可达，请手动处理")
-                        take_screenshot(page, "10_port_still_unreachable")
+                        log.warning(f"⚠️ Restart 后端口仍不可达，请手动处理")
+                        take_screenshot(page, "09_port_still_unreachable")
                         return False
             except ValueError:
                 pass
@@ -637,25 +640,41 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
 
     time.sleep(3)
 
-    # ✅ 关掉所有弹窗（广告/GDPR）再操作，避免广告弹窗拦截点击
     log.info("关闭页面上所有弹窗...")
     dismiss_all_popups(page)
     time.sleep(1)
 
-    # 点击 Renew Server（<a> 标签，onclick，不是 <button>）
+    # 点击 Renew Server
     try:
-        renew_btn = page.locator(
-            'a:has-text("Renew Server"), button:has-text("Renew Server")'
-        ).first
-        if not renew_btn.is_visible(timeout=8000):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1)
-            renew_btn = page.locator(
-                'a:has-text("Renew Server"), button:has-text("Renew Server")'
-            ).first
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1)
 
-        renew_btn.click()
-        log.info("已点击 Renew Server 按钮")
+        clicked = page.evaluate("""() => {
+            var els = Array.from(document.querySelectorAll('a, button'));
+            for (var el of els) {
+                var txt = (el.innerText || el.textContent || '').trim();
+                if (txt === 'Renew Server' || txt.includes('Renew Server')) {
+                    el.scrollIntoView({block: 'center'});
+                    if (el.onclick) { el.onclick(new MouseEvent('click')); return 'onclick'; }
+                    el.click();
+                    return 'click';
+                }
+            }
+            return null;
+        }""")
+
+        if not clicked:
+            log.warning("JS 未找到 Renew Server 按钮，尝试 Playwright locator...")
+            renew_btn = page.locator('a:has-text("Renew Server"), button:has-text("Renew Server")').first
+            renew_btn.scroll_into_view_if_needed()
+            time.sleep(0.5)
+            renew_btn.click(force=True)
+            log.info("已点击 Renew Server 按钮（locator force click）")
+        else:
+            log.info(f"已点击 Renew Server 按钮（JS {clicked}）")
+
         take_screenshot(page, "05_renew_clicked")
     except Exception as e:
         log.warning(f"点击 Renew Server 失败: {e}")
@@ -663,26 +682,30 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
 
     time.sleep(2)
 
-    # 如果续期弹窗出现前又跳出广告，再清一次
     dismiss_all_popups(page)
     time.sleep(1)
 
     take_screenshot(page, "06_renew_modal")
 
-    # 等待 CF Turnstile 验证（会先检查 renewModal 是否真的出现）
     if not wait_cf_turnstile(page, timeout=60):
         log.warning("CF 验证超时或续期弹窗未出现，续期失败")
         take_screenshot(page, "06_cf_timeout")
         return False
 
-    # 等待页面刷新 / 弹窗消失
-    time.sleep(5)
+    time.sleep(8)
     take_screenshot(page, "07_after_renew")
 
-    # ✅ 用 expiry 是否增加来判断是否真正续期成功，不依赖弹窗状态
+    try:
+        page.reload(timeout=20000, wait_until="domcontentloaded")
+        time.sleep(3)
+        dismiss_all_popups(page)
+        time.sleep(1)
+    except Exception as e:
+        log.warning(f"续期后刷新页面失败: {e}")
+
     info_after = page.evaluate("""() => {
         var body = document.body.innerText || '';
-        var m = body.match(/Expiry[^:]*:\\s*([^\\n]+)/i);
+        var m = body.match(/Expiry[^:]*:\s*([^\n]+)/i);
         return m ? m[1].trim() : null;
     }""")
     log.info(f"续期后 expiry（页面直读）: {info_after}")
@@ -692,13 +715,12 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
 
     log.info(f"续期前 expiry 分钟数: {minutes_before}, 续期后: {minutes_after}")
 
-    # 成功条件：续期后时间 > 续期前时间（增加了说明成功），或续期后时间接近2天（>= 23h）
-    if minutes_after > minutes_before or minutes_after >= 23 * 60:
-        log.info(f"✅ 续期成功！expiry: {expiry_before} → {info_after}")
+    if minutes_after > minutes_before:
+        log.info(f"✅ 续期成功！expiry: {expiry_before} → {info_after}（增加了 {minutes_after - minutes_before} 分钟）")
         return True
 
-    # 如果数值没变或变小，可能真的没续期成功
-    log.warning(f"⚠️ 续期后 expiry 未增加（{expiry_before} → {info_after}），续期可能失败")
+    log.warning(f"⚠️ 续期后 expiry 未增加（{expiry_before} → {info_after}），续期失败！"
+                f"（前={minutes_before}min，后={minutes_after}min）")
     return False
 
 # ---------- 主流程 ----------
@@ -751,7 +773,7 @@ def main():
                 status = "Start Failed / Timeout"
                 log.warning("⚠️ 服务器启动失败或超时，未能确认 Running")
 
-        # 5. 续期（SKIP_RENEW=true 时跳过，只做启动）
+        # 5. 续期
         if SKIP_RENEW:
             log.info("⏭️ SKIP_RENEW=true，跳过续期步骤（Uptime Kuma 紧急启动模式）")
             renewed = False
@@ -776,7 +798,7 @@ def main():
         if started:
             lines.append("  → 已启动，面板 Running + 端口可连接 ✅")
         elif "stopped" in status.lower() or "offline" in status.lower() or "failed" in status.lower():
-            lines.append("  ⚠️ 启动失败（已尝试 Stop→Start 彻底重启），端口仍不可达，请手动处理")
+            lines.append("  ⚠️ 启动失败（含自动 Restart 重试），端口仍不可达，请手动处理")
         lines.append("")
         lines.append(f"Expiry (Next Renewal): {new_expiry}")
         if last_renew:
