@@ -14,7 +14,7 @@ on:
           - 'false'
           - 'true'
       enable_recording:
-        description: '启用录屏（true=录制操作视频，false=不录制）'
+        description: '录屏（true=录屏，false=不录屏）'
         required: false
         default: 'false'
         type: choice
@@ -26,7 +26,7 @@ jobs:
   zampto-auto:
     name: 检查状态 / 自动续期
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minins: 20
 
     steps:
       - name: 检出代码
@@ -73,6 +73,7 @@ jobs:
           WXPUSHER_TOKEN:   ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID:     ${{ secrets.WXPUSHER_UID }}
           FORCE_RENEW:      ${{ github.event.inputs.force_renew || 'false' }}
+          ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
           DISPLAY:          ":99"
           LIBGL_ALWAYS_SOFTWARE: "1"
           GALLIUM_DRIVER:   "llvmpipe"
@@ -82,8 +83,8 @@ jobs:
           sleep 2
 
           RECORD_PID=""
-          if [ "${{ github.event.inputs.enable_recording || 'false' }}" = "true" ]; then
-            echo "🎥 录屏已启用"
+          if [ "$ENABLE_RECORDING" = "true" ]; then
+            echo "🎬 录屏已启用"
             ffmpeg -f x11grab -video_size 1280x720 -framerate 10 -i :99 \
               -codec:v libx264 -preset ultrafast -crf 30 \
               -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
@@ -91,16 +92,14 @@ jobs:
             RECORD_PID=$!
             sleep 2
           else
-            echo "🎥 录屏已禁用（可在手动触发时将 enable_recording 设为 true）"
+            echo "🎬 录屏未启用（如需录屏，手动触发时选择 enable_recording=true）"
           fi
 
           timeout 600 python zampto_auto.py || echo "脚本退出码: $?"
 
           sleep 2
-          if [ -n "$RECORD_PID" ]; then
-            kill $RECORD_PID 2>/dev/null || true
-            wait $RECORD_PID 2>/dev/null || true
-          fi
+          [ -n "$RECORD_PID" ] && kill $RECORD_PID 2>/dev/null || true
+          [ -n "$RECORD_PID" ] && wait $RECORD_PID 2>/dev/null || true
           kill $XVFB_PID 2>/dev/null || true
 
       - name: 上传截图和录屏
@@ -110,11 +109,10 @@ jobs:
           name: debug-${{ github.run_number }}
           path: |
             ./screenshots/*.png
-            /tmp/recording.mp4
-            /tmp/ffmpeg.log
+            ${{ github.event.inputs.enable_recording == 'true' && '/tmp/recording.mp4' || '' }}
+            ${{ github.event.inputs.enable_recording == 'true' && '/tmp/ffmpeg.log' || '' }}
           if-no-files-found: ignore
           retention-days: 3
-          # 注意：若 enable_recording=false，recording.mp4 不会生成，上传时自动忽略
 
       - name: 清理旧运行记录（只保留最新 1 条）
         if: always()
